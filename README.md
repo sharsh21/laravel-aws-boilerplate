@@ -77,7 +77,17 @@ terraform output alb_dns_name
 
 Create a CNAME record in your DNS pointing to the ALB DNS name.
 
-### 4. Set up GitHub Actions secrets
+### 4. Copy GitHub Actions workflows into your Laravel app
+
+The workflow files live in `examples/workflows/`. Copy them into your Laravel project:
+
+```bash
+mkdir -p your-laravel-app/.github/workflows
+cp examples/workflows/ci.yml your-laravel-app/.github/workflows/
+cp examples/workflows/deploy.yml your-laravel-app/.github/workflows/
+```
+
+### 6. Set up GitHub Actions secrets
 
 In your GitHub repo → Settings → Secrets and variables → Actions, add:
 
@@ -98,7 +108,7 @@ In Variables (not secrets), add:
 | `TASK_DEFINITION_APP` | `{app_name}-{environment}-app` |
 | `TASK_DEFINITION_WORKER` | `{app_name}-{environment}-worker` |
 
-### 5. First deploy
+### 7. First deploy
 
 ```bash
 # One-time: build and push your Laravel app image manually
@@ -153,6 +163,48 @@ aws ecs update-service \
   --cluster myapp-production \
   --service myapp-production-app \
   --force-new-deployment
+```
+
+---
+
+## Laravel logging → CloudWatch
+
+All Laravel logs are automatically shipped to CloudWatch Logs via the ECS `awslogs` driver — no extra package needed.
+
+**Log groups created by Terraform:**
+- `/ecs/{app_name}-{environment}/app` — web app logs
+- `/ecs/{app_name}-{environment}/worker` — queue worker logs
+
+**Configure JSON structured logging** (recommended — enables Log Insights queries):
+
+Copy `examples/config/logging.php` into your Laravel app:
+
+```bash
+cp examples/config/logging.php your-laravel-app/config/logging.php
+```
+
+This formats every log entry as JSON so you can query them in CloudWatch Log Insights:
+
+```
+# Find all errors in the last hour
+fields @timestamp, message, context.exception
+| filter level = "error" or level = "critical"
+| sort @timestamp desc
+| limit 50
+```
+
+**CloudWatch alarms created automatically:**
+| Alarm | Threshold |
+|---|---|
+| Laravel error rate | ≥ 10 errors in 5 min |
+| ECS CPU | ≥ 85% for 10 min |
+| ALB 5xx | ≥ 20 errors in 3 min |
+
+Set `alert_email` in `terraform.tfvars` to receive email notifications. After `terraform apply` you'll get a confirmation email to activate the subscription.
+
+**Access your dashboard:**
+```bash
+terraform output cloudwatch_dashboard_url
 ```
 
 ---

@@ -98,4 +98,5 @@ module "ecs" {
   certificate_arn       = var.certificate_arn
   alb_security_group_id = module.networking.alb_security_group_id
   app_security_group_id = module.networking.app_security_group_id
+  alert_email           = var.alert_email
 }

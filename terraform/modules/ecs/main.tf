@@ -385,3 +385,171 @@ resource "aws_appautoscaling_policy" "app_cpu" {
     scale_out_cooldown = 60
   }
 }
+
+# ─── CloudWatch: Laravel log metric filters + alarms ───────────────────────
+
+resource "aws_cloudwatch_log_metric_filter" "laravel_errors" {
+  name           = "${var.app_name}-${var.environment}-laravel-errors"
+  log_group_name = aws_cloudwatch_log_group.app.name
+  # Matches both plain-text and JSON structured logs
+  pattern        = "?\"level\":\"error\" ?\"level\":\"critical\" ?ERROR ?CRITICAL"
+
+  metric_transformation {
+    name      = "LaravelErrors"
+    namespace = "${var.app_name}/${var.environment}"
+    value     = "1"
+    unit      = "Count"
+  }
+}
+
+resource "aws_cloudwatch_log_metric_filter" "laravel_worker_errors" {
+  name           = "${var.app_name}-${var.environment}-worker-errors"
+  log_group_name = aws_cloudwatch_log_group.worker.name
+  pattern        = "?\"level\":\"error\" ?\"level\":\"critical\" ?ERROR ?CRITICAL"
+
+  metric_transformation {
+    name      = "LaravelWorkerErrors"
+    namespace = "${var.app_name}/${var.environment}"
+    value     = "1"
+    unit      = "Count"
+  }
+}
+
+resource "aws_sns_topic" "alerts" {
+  name = "${var.app_name}-${var.environment}-alerts"
+}
+
+resource "aws_sns_topic_subscription" "alert_email" {
+  count     = var.alert_email != "" ? 1 : 0
+  topic_arn = aws_sns_topic.alerts.arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+}
+
+resource "aws_cloudwatch_metric_alarm" "laravel_error_rate" {
+  alarm_name          = "${var.app_name}-${var.environment}-high-error-rate"
+  alarm_description   = "Laravel is logging errors at a high rate"
+  namespace           = "${var.app_name}/${var.environment}"
+  metric_name         = "LaravelErrors"
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 1
+  threshold           = 10
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "ecs_app_cpu" {
+  alarm_name          = "${var.app_name}-${var.environment}-high-cpu"
+  alarm_description   = "ECS app service CPU is high"
+  namespace           = "AWS/ECS"
+  metric_name         = "CPUUtilization"
+  statistic           = "Average"
+  period              = 300
+  evaluation_periods  = 2
+  threshold           = 85
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    ClusterName = aws_ecs_cluster.main.name
+    ServiceName = aws_ecs_service.app.name
+  }
+
+  alarm_actions = [aws_sns_topic.alerts.arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "alb_5xx" {
+  alarm_name          = "${var.app_name}-${var.environment}-alb-5xx"
+  alarm_description   = "ALB is returning 5xx errors"
+  namespace           = "AWS/ApplicationELB"
+  metric_name         = "HTTPCode_Target_5XX_Count"
+  statistic           = "Sum"
+  period              = 60
+  evaluation_periods  = 3
+  threshold           = 20
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    LoadBalancer = aws_lb.main.arn_suffix
+  }
+
+  alarm_actions = [aws_sns_topic.alerts.arn]
+}
+
+# CloudWatch dashboard — single pane for the whole stack
+resource "aws_cloudwatch_dashboard" "main" {
+  dashboard_name = "${var.app_name}-${var.environment}"
+
+  dashboard_body = jsonencode({
+    widgets = [
+      {
+        type = "log"
+        properties = {
+          title   = "Laravel App Errors (last 1h)"
+          region  = var.aws_region
+          view    = "table"
+          query   = "SOURCE '${aws_cloudwatch_log_group.app.name}' | fields @timestamp, message, context.exception | filter level = 'error' or level = 'critical' | sort @timestamp desc | limit 50"
+          period  = 3600
+        }
+        width = 24; height = 6; x = 0; y = 0
+      },
+      {
+        type = "log"
+        properties = {
+          title  = "Worker Errors (last 1h)"
+          region = var.aws_region
+          view   = "table"
+          query  = "SOURCE '${aws_cloudwatch_log_group.worker.name}' | fields @timestamp, message | filter level = 'error' or level = 'critical' | sort @timestamp desc | limit 20"
+          period = 3600
+        }
+        width = 24; height = 4; x = 0; y = 6
+      },
+      {
+        type = "metric"
+        properties = {
+          title  = "Laravel Error Rate"
+          region = var.aws_region
+          metrics = [["${var.app_name}/${var.environment}", "LaravelErrors"]]
+          period = 300
+          stat   = "Sum"
+          view   = "timeSeries"
+        }
+        width = 8; height = 4; x = 0; y = 10
+      },
+      {
+        type = "metric"
+        properties = {
+          title  = "ALB 5xx / 4xx"
+          region = var.aws_region
+          metrics = [
+            ["AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "LoadBalancer", aws_lb.main.arn_suffix],
+            ["AWS/ApplicationELB", "HTTPCode_Target_4XX_Count", "LoadBalancer", aws_lb.main.arn_suffix]
+          ]
+          period = 60
+          stat   = "Sum"
+          view   = "timeSeries"
+        }
+        width = 8; height = 4; x = 8; y = 10
+      },
+      {
+        type = "metric"
+        properties = {
+          title  = "ECS CPU / Memory"
+          region = var.aws_region
+          metrics = [
+            ["AWS/ECS", "CPUUtilization", "ClusterName", aws_ecs_cluster.main.name, "ServiceName", aws_ecs_service.app.name],
+            ["AWS/ECS", "MemoryUtilization", "ClusterName", aws_ecs_cluster.main.name, "ServiceName", aws_ecs_service.app.name]
+          ]
+          period = 60
+          stat   = "Average"
+          view   = "timeSeries"
+        }
+        width = 8; height = 4; x = 16; y = 10
+      }
+    ]
+  })
+}

@@ -37,3 +37,11 @@ output "ecs_service_app" {
 output "ecs_service_worker" {
   value = module.ecs.service_worker_name
 }
+
+output "cloudwatch_dashboard_url" {
+  value = module.ecs.cloudwatch_dashboard_url
+}
+
+output "alerts_sns_topic_arn" {
+  value = module.ecs.alerts_sns_topic_arn
+}

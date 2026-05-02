@@ -103,3 +103,9 @@ variable "certificate_arn" {
   description = "ACM certificate ARN for HTTPS on the ALB"
   type        = string
 }
+
+variable "alert_email" {
+  description = "Email for CloudWatch alarm notifications (errors, high CPU, 5xx)"
+  type        = string
+  default     = ""
+}

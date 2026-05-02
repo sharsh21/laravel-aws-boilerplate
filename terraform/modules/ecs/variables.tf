@@ -22,3 +22,8 @@ variable "db_username" { type = string }
 variable "db_password_arn" { type = string }
 variable "redis_host" { type = string }
 variable "certificate_arn" { type = string }
+variable "alert_email" {
+  description = "Email to receive CloudWatch alarm notifications (leave empty to skip)"
+  type        = string
+  default     = ""
+}

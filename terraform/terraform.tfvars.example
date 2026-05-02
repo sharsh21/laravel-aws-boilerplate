@@ -19,6 +19,9 @@ image_tag          = "latest"
 # ACM cert ARN (must be in same region as ALB)
 certificate_arn = "arn:aws:acm:us-east-1:123456789:certificate/xxxx"
 
+# Email for CloudWatch alarm notifications (errors, high CPU, ALB 5xx)
+alert_email = "you@example.com"
+
 # App container sizing
 app_cpu    = 512
 app_memory = 1024
