@@ -1,0 +1,50 @@
+app_name        = "myapp"
+environment     = "production"
+aws_region      = "us-east-1"
+availability_zones = ["us-east-1a", "us-east-1b"]
+
+# RDS
+db_name         = "myapp"
+db_username     = "myapp"
+rds_instance_class = "db.t3.micro"
+rds_multi_az    = true
+
+# Redis
+redis_node_type = "cache.t3.micro"
+
+# ECS — paste your ECR repo URL here
+ecr_repository_url = "123456789.dkr.ecr.us-east-1.amazonaws.com/myapp"
+image_tag          = "latest"
+
+# ACM cert ARN (must be in same region as ALB)
+certificate_arn = "arn:aws:acm:us-east-1:123456789:certificate/xxxx"
+
+# App container sizing
+app_cpu    = 512
+app_memory = 1024
+app_count  = 2
+
+worker_cpu    = 256
+worker_memory = 512
+worker_count  = 1
+
+# Laravel .env values — stored encrypted in SSM Parameter Store
+app_env = {
+  APP_NAME      = "MyApp"
+  APP_ENV       = "production"
+  APP_KEY       = ""          # generate with: php artisan key:generate --show
+  APP_DEBUG     = "false"
+  APP_URL       = "https://myapp.com"
+
+  DB_CONNECTION = "mysql"
+  # DB_HOST, DB_DATABASE, DB_USERNAME, DB_PASSWORD are injected automatically by Terraform
+
+  CACHE_DRIVER   = "redis"
+  SESSION_DRIVER = "redis"
+  QUEUE_CONNECTION = "sqs"
+
+  MAIL_MAILER     = "ses"
+  AWS_DEFAULT_REGION = "us-east-1"
+
+  LOG_CHANNEL = "stderr"
+}

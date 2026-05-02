@@ -1,0 +1,24 @@
+# Laravel
+/vendor/
+/node_modules/
+.env
+.env.backup
+.env.production
+.phpunit.result.cache
+/storage/*.key
+/public/hot
+/public/storage
+Homestead.json
+Homestead.yaml
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfstate.*.backup
+.terraform.lock.hcl
+terraform.tfvars
+*.auto.tfvars
+
+# Docker
+*.log
