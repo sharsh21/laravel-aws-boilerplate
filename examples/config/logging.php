@@ -5,7 +5,13 @@ use Monolog\Handler\StreamHandler;
 
 return [
 
-    'default' => env('LOG_CHANNEL', 'stderr'),
+    /*
+    | On ECS: LOG_CHANNEL=daily is injected by Terraform.
+    | Laravel writes to storage/logs/laravel-YYYY-MM-DD.log.
+    | The CloudWatch agent sidecar reads that file and ships it to
+    | CloudWatch log group: /ecs/{app}-{env}/laravel
+    */
+    'default' => env('LOG_CHANNEL', 'daily'),
 
     'deprecations' => [
         'channel' => env('LOG_DEPRECATIONS_CHANNEL', 'null'),

@@ -121,8 +121,19 @@ resource "aws_iam_role_policy" "task_permissions" {
       },
       {
         Effect   = "Allow"
-        Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+        Action   = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+          "logs:DescribeLogStreams"
+        ]
         Resource = "*"
+      },
+      # CWAgent needs to read its own config from SSM
+      {
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/${var.app_name}/${var.environment}/cwagent-config"
       }
     ]
   })
@@ -137,6 +148,48 @@ resource "aws_cloudwatch_log_group" "app" {
 resource "aws_cloudwatch_log_group" "worker" {
   name              = "/ecs/${var.app_name}-${var.environment}/worker"
   retention_in_days = 30
+}
+
+# Dedicated log group for laravel.log (shipped by CWAgent sidecar)
+resource "aws_cloudwatch_log_group" "laravel" {
+  name              = "/ecs/${var.app_name}-${var.environment}/laravel"
+  retention_in_days = 30
+}
+
+resource "aws_cloudwatch_log_group" "cwagent_app" {
+  name              = "/ecs/${var.app_name}-${var.environment}/cwagent-app"
+  retention_in_days = 7
+}
+
+resource "aws_cloudwatch_log_group" "cwagent_worker" {
+  name              = "/ecs/${var.app_name}-${var.environment}/cwagent-worker"
+  retention_in_days = 7
+}
+
+# CWAgent config stored in SSM — reads laravel.log from shared volume
+resource "aws_ssm_parameter" "cwagent_config" {
+  name  = "/${var.app_name}/${var.environment}/cwagent-config"
+  type  = "String"
+  value = jsonencode({
+    logs = {
+      logs_collected = {
+        files = {
+          collect_list = [
+            {
+              file_path             = "/logs/laravel-*.log"
+              log_group_name        = aws_cloudwatch_log_group.laravel.name
+              log_stream_name       = "{hostname}"
+              timestamp_format      = "[%Y-%m-%d %H:%M:%S]"
+              # Groups multi-line stack traces into one log event
+              multi_line_start_pattern = "^\\[\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\]"
+              encoding              = "utf-8"
+            }
+          ]
+        }
+      }
+      log_stream_name = "${var.app_name}-${var.environment}"
+    }
+  })
 }
 
 # SQS Queue for Laravel queues
@@ -222,42 +275,84 @@ resource "aws_ecs_task_definition" "app" {
   family                   = "${var.app_name}-${var.environment}-app"
   network_mode             = "awsvpc"
   requires_compatibilities = ["FARGATE"]
+  # Add ~256 CPU + 256 MB headroom for the CWAgent sidecar
   cpu                      = var.app_cpu
   memory                   = var.app_memory
   execution_role_arn       = aws_iam_role.execution.arn
   task_role_arn            = aws_iam_role.task.arn
 
-  container_definitions = jsonencode([{
-    name      = "app"
-    image     = "${var.ecr_repository_url}:${var.image_tag}"
-    essential = true
+  # Shared ephemeral volume: app writes laravel.log here, CWAgent reads it
+  volume {
+    name = "app-logs"
+  }
 
-    portMappings = [{ containerPort = 80 }]
+  container_definitions = jsonencode([
+    {
+      name      = "app"
+      image     = "${var.ecr_repository_url}:${var.image_tag}"
+      essential = true
 
-    environment = [
-      { name = "DB_HOST",     value = var.db_host },
-      { name = "DB_DATABASE", value = var.db_name },
-      { name = "DB_USERNAME", value = var.db_username },
-      { name = "REDIS_HOST",  value = var.redis_host },
-      { name = "SQS_QUEUE",   value = aws_sqs_queue.main.url },
-      { name = "AWS_DEFAULT_REGION", value = var.aws_region },
-      { name = "FILESYSTEM_DISK", value = "s3" },
-      { name = "AWS_BUCKET",  value = var.s3_bucket_name },
-    ]
+      portMappings = [{ containerPort = 80 }]
 
-    secrets = [
-      { name = "DB_PASSWORD", valueFrom = var.db_password_arn }
-    ]
+      mountPoints = [{
+        sourceVolume  = "app-logs"
+        containerPath = "/var/www/html/storage/logs"
+        readOnly      = false
+      }]
 
-    logConfiguration = {
-      logDriver = "awslogs"
-      options = {
-        "awslogs-group"         = aws_cloudwatch_log_group.app.name
-        "awslogs-region"        = var.aws_region
-        "awslogs-stream-prefix" = "app"
+      environment = [
+        { name = "DB_HOST",              value = var.db_host },
+        { name = "DB_DATABASE",          value = var.db_name },
+        { name = "DB_USERNAME",          value = var.db_username },
+        { name = "REDIS_HOST",           value = var.redis_host },
+        { name = "SQS_QUEUE",            value = aws_sqs_queue.main.url },
+        { name = "AWS_DEFAULT_REGION",   value = var.aws_region },
+        { name = "FILESYSTEM_DISK",      value = "s3" },
+        { name = "AWS_BUCKET",           value = var.s3_bucket_name },
+        { name = "LOG_CHANNEL",          value = "daily" },
+      ]
+
+      secrets = [
+        { name = "DB_PASSWORD", valueFrom = var.db_password_arn }
+      ]
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.app.name
+          "awslogs-region"        = var.aws_region
+          "awslogs-stream-prefix" = "app"
+        }
+      }
+    },
+    {
+      name      = "cloudwatch-agent"
+      image     = "public.ecr.aws/cloudwatch-agent/cloudwatch-agent:latest"
+      essential = false
+
+      mountPoints = [{
+        sourceVolume  = "app-logs"
+        containerPath = "/logs"
+        readOnly      = true
+      }]
+
+      environment = [
+        {
+          name  = "CW_CONFIG_CONTENT"
+          value = aws_ssm_parameter.cwagent_config.value
+        }
+      ]
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.cwagent_app.name
+          "awslogs-region"        = var.aws_region
+          "awslogs-stream-prefix" = "cwagent"
+        }
       }
     }
-  }])
+  ])
 }
 
 # Worker Task Definition
@@ -270,38 +365,78 @@ resource "aws_ecs_task_definition" "worker" {
   execution_role_arn       = aws_iam_role.execution.arn
   task_role_arn            = aws_iam_role.task.arn
 
-  container_definitions = jsonencode([{
-    name      = "app"
-    image     = "${var.ecr_repository_url}:${var.image_tag}"
-    essential = true
+  volume {
+    name = "worker-logs"
+  }
 
-    command = ["php", "artisan", "queue:work", "sqs",
-               "--sleep=3", "--tries=3", "--max-time=3600"]
+  container_definitions = jsonencode([
+    {
+      name      = "app"
+      image     = "${var.ecr_repository_url}:${var.image_tag}"
+      essential = true
 
-    environment = [
-      { name = "DB_HOST",     value = var.db_host },
-      { name = "DB_DATABASE", value = var.db_name },
-      { name = "DB_USERNAME", value = var.db_username },
-      { name = "REDIS_HOST",  value = var.redis_host },
-      { name = "SQS_QUEUE",   value = aws_sqs_queue.main.url },
-      { name = "AWS_DEFAULT_REGION", value = var.aws_region },
-      { name = "FILESYSTEM_DISK", value = "s3" },
-      { name = "AWS_BUCKET",  value = var.s3_bucket_name },
-    ]
+      command = ["php", "artisan", "queue:work", "sqs",
+                 "--sleep=3", "--tries=3", "--max-time=3600"]
 
-    secrets = [
-      { name = "DB_PASSWORD", valueFrom = var.db_password_arn }
-    ]
+      mountPoints = [{
+        sourceVolume  = "worker-logs"
+        containerPath = "/var/www/html/storage/logs"
+        readOnly      = false
+      }]
 
-    logConfiguration = {
-      logDriver = "awslogs"
-      options = {
-        "awslogs-group"         = aws_cloudwatch_log_group.worker.name
-        "awslogs-region"        = var.aws_region
-        "awslogs-stream-prefix" = "worker"
+      environment = [
+        { name = "DB_HOST",              value = var.db_host },
+        { name = "DB_DATABASE",          value = var.db_name },
+        { name = "DB_USERNAME",          value = var.db_username },
+        { name = "REDIS_HOST",           value = var.redis_host },
+        { name = "SQS_QUEUE",            value = aws_sqs_queue.main.url },
+        { name = "AWS_DEFAULT_REGION",   value = var.aws_region },
+        { name = "FILESYSTEM_DISK",      value = "s3" },
+        { name = "AWS_BUCKET",           value = var.s3_bucket_name },
+        { name = "LOG_CHANNEL",          value = "daily" },
+      ]
+
+      secrets = [
+        { name = "DB_PASSWORD", valueFrom = var.db_password_arn }
+      ]
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.worker.name
+          "awslogs-region"        = var.aws_region
+          "awslogs-stream-prefix" = "worker"
+        }
+      }
+    },
+    {
+      name      = "cloudwatch-agent"
+      image     = "public.ecr.aws/cloudwatch-agent/cloudwatch-agent:latest"
+      essential = false
+
+      mountPoints = [{
+        sourceVolume  = "worker-logs"
+        containerPath = "/logs"
+        readOnly      = true
+      }]
+
+      environment = [
+        {
+          name  = "CW_CONFIG_CONTENT"
+          value = aws_ssm_parameter.cwagent_config.value
+        }
+      ]
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.cwagent_worker.name
+          "awslogs-region"        = var.aws_region
+          "awslogs-stream-prefix" = "cwagent"
+        }
       }
     }
-  }])
+  ])
 }
 
 # App ECS Service
@@ -390,9 +525,9 @@ resource "aws_appautoscaling_policy" "app_cpu" {
 
 resource "aws_cloudwatch_log_metric_filter" "laravel_errors" {
   name           = "${var.app_name}-${var.environment}-laravel-errors"
-  log_group_name = aws_cloudwatch_log_group.app.name
-  # Matches both plain-text and JSON structured logs
-  pattern        = "?\"level\":\"error\" ?\"level\":\"critical\" ?ERROR ?CRITICAL"
+  log_group_name = aws_cloudwatch_log_group.laravel.name
+  # Matches Laravel's default log format: production.ERROR and production.CRITICAL
+  pattern        = "?ERROR ?CRITICAL"
 
   metric_transformation {
     name      = "LaravelErrors"
@@ -404,8 +539,8 @@ resource "aws_cloudwatch_log_metric_filter" "laravel_errors" {
 
 resource "aws_cloudwatch_log_metric_filter" "laravel_worker_errors" {
   name           = "${var.app_name}-${var.environment}-worker-errors"
-  log_group_name = aws_cloudwatch_log_group.worker.name
-  pattern        = "?\"level\":\"error\" ?\"level\":\"critical\" ?ERROR ?CRITICAL"
+  log_group_name = aws_cloudwatch_log_group.laravel.name
+  pattern        = "?ERROR ?CRITICAL"
 
   metric_transformation {
     name      = "LaravelWorkerErrors"
@@ -492,7 +627,7 @@ resource "aws_cloudwatch_dashboard" "main" {
           title   = "Laravel App Errors (last 1h)"
           region  = var.aws_region
           view    = "table"
-          query   = "SOURCE '${aws_cloudwatch_log_group.app.name}' | fields @timestamp, message, context.exception | filter level = 'error' or level = 'critical' | sort @timestamp desc | limit 50"
+          query   = "SOURCE '${aws_cloudwatch_log_group.laravel.name}' | fields @timestamp, level, message, context.exception | filter level = 'error' or level = 'critical' | sort @timestamp desc | limit 50"
           period  = 3600
         }
         width = 24; height = 6; x = 0; y = 0
@@ -503,7 +638,7 @@ resource "aws_cloudwatch_dashboard" "main" {
           title  = "Worker Errors (last 1h)"
           region = var.aws_region
           view   = "table"
-          query  = "SOURCE '${aws_cloudwatch_log_group.worker.name}' | fields @timestamp, message | filter level = 'error' or level = 'critical' | sort @timestamp desc | limit 20"
+          query  = "SOURCE '${aws_cloudwatch_log_group.laravel.name}' | fields @timestamp, level, message | filter level = 'error' or level = 'critical' | sort @timestamp desc | limit 20"
           period = 3600
         }
         width = 24; height = 4; x = 0; y = 6
